@@ -2,11 +2,14 @@ const express = require("express");
 const cors = require("cors");
 const app = express();
 const jwt = require("jsonwebtoken");
+require("dotenv").config();
+const stripe = require("stripe")(process.env.PAYMENT_SECRET_KEY);
 const port = process.env.PORT || 5000;
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 app.use(cors());
 app.use(express.json());
-require("dotenv").config();
+
+//console.log(process.env.PAYMENT_SECRET_KEY);
 
 const verifyJWT = (req, res, next) => {
   const authorization = req.headers.authorization;
@@ -49,6 +52,9 @@ async function run() {
     const menuCollection = client.db("bristroBossDB").collection("menus");
     const cartsCollection = client.db("bristroBossDB").collection("carts");
     const usersCollection = client.db("bristroBossDB").collection("users");
+    const paymentsCollection = client
+      .db("bristroBossDB")
+      .collection("payments");
 
     app.post("/jwt", (req, res) => {
       const user = req.body;
@@ -168,6 +174,85 @@ async function run() {
       const result = await cartsCollection.find(query).toArray();
       res.send(result);
       //console.log(email);
+    });
+
+    //payment gets implements api
+
+    app.post("/create-payment-intent", verifyJWT, async (req, res) => {
+      const { price } = req.body;
+      const amount = price * 100;
+
+      // Create a PaymentIntent with the order amount and currency
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: amount,
+        currency: "usd",
+        automatic_payment_methods: {
+          enabled: true,
+        },
+      });
+
+      res.send({
+        clientSecret: paymentIntent.client_secret,
+      });
+    });
+
+    app.post("/payment", verifyJWT, async (req, res) => {
+      const payment = req.body;
+      const insertResult = await paymentsCollection.insertOne(payment);
+      const query = {
+        _id: { $in: payment.cartId.map((id) => new ObjectId(id)) },
+      };
+      const deleteCart = await cartsCollection.deleteMany(query);
+      res.send({ insertResult, deleteCart });
+    });
+
+    app.get("/admin-stats", verifyJWT, verifyAdmin, async (req, res) => {
+      const orders = await paymentsCollection.estimatedDocumentCount();
+      const allUsers = await usersCollection.estimatedDocumentCount();
+      const adminUser = await usersCollection.countDocuments({
+        role: "admin",
+      });
+      const users = allUsers - adminUser;
+
+      const product = await menuCollection.estimatedDocumentCount();
+      const payment = await paymentsCollection.find().toArray();
+      const revenue = payment.reduce((sum, item) => item.price + sum, 0);
+
+      res.send({ orders, users, product, revenue, adminUser });
+    });
+
+    app.get("/order-stats", verifyJWT, verifyAdmin, async (req, res) => {
+      const pipeline = [
+        {
+          $lookup: {
+            from: "menus",
+            localField: "menuId",
+            foreignField: "_id",
+            as: "menuItemsData",
+          },
+        },
+        {
+          $unwind: "$menuItemsData",
+        },
+        {
+          $group: {
+            _id: "$menuItemsData.category",
+            count: { $sum: 1 },
+            total: { $sum: "$menuItemsData.price" },
+          },
+        },
+        {
+          $project: {
+            category: "$_id",
+            count: 1,
+            total: { $round: ["$total", 2] },
+            _id: 0,
+          },
+        },
+      ];
+
+      const result = await paymentsCollection.aggregate(pipeline).toArray();
+      res.send(result);
     });
 
     // Send a ping to confirm a successful connection
